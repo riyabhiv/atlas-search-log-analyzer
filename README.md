@@ -6,9 +6,7 @@ interactive HTML report with sortable/filterable tables, severity-ranked
 opportunities, and a per-namespace migration task checklist.
 
 Designed to handle very large logs (multi-GB) by streaming line-by-line and
-aggregating by `queryHash`, in the spirit of
-[mhelmstetter/mongo-log-parser](https://github.com/mhelmstetter/mongo-log-parser).
-
+aggregating by `queryHash`
 ## What it detects
 
 | Category | Atlas Search migration |
