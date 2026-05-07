@@ -47,6 +47,14 @@ from html import escape
 from pathlib import Path
 from typing import Any, Iterable
 
+from recommend import (
+    QueryProfile,
+    build_index_definition,
+    build_search_pipeline,
+    build_notes,
+    to_pretty_json,
+)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -90,6 +98,9 @@ class QueryShape:
     sample_filter: str = ""         # truncated JSON of filter
     sample_log_line: str = ""       # one raw log line (pretty-printed JSON)
     sample_timestamp: str = ""
+
+    # Structured profile used by the Atlas Search recommendation engine
+    profile: QueryProfile | None = None
 
     def docs_per_returned(self) -> float:
         if self.total_docs_returned <= 0:
@@ -179,13 +190,36 @@ def extract_event(entry: dict[str, Any]) -> dict[str, Any] | None:
     filt = command.get("filter") or command.get("q")
     pipeline = command.get("pipeline") if isinstance(command.get("pipeline"), list) else None
 
+    # Extract sort / skip / limit from either the command directly (find) or
+    # from any matching pipeline stages (aggregate).
+    sort_doc = command.get("sort") if isinstance(command.get("sort"), dict) else None
+    limit_v = command.get("limit") if isinstance(command.get("limit"), int) else None
+    skip_v = command.get("skip") if isinstance(command.get("skip"), int) else None
+    if pipeline:
+        for stage in pipeline:
+            if not isinstance(stage, dict):
+                continue
+            if "$sort" in stage and isinstance(stage["$sort"], dict) and sort_doc is None:
+                sort_doc = stage["$sort"]
+            if "$limit" in stage and isinstance(stage["$limit"], int) and limit_v is None:
+                limit_v = stage["$limit"]
+            if "$skip" in stage and isinstance(stage["$skip"], int) and skip_v is None:
+                skip_v = stage["$skip"]
+
+    # Collection name (without database prefix)
+    collection = ns.split(".", 1)[1] if "." in ns else ns
+
     return {
         "ts": _stringify_ts(entry.get("t")),
         "ns": ns,
+        "collection": collection,
         "op_type": op_type,
         "app_name": attr.get("appName", "") or "",
         "filter": filt if isinstance(filt, dict) else {},
         "pipeline": pipeline,
+        "sort": sort_doc,
+        "limit": limit_v,
+        "skip": skip_v,
         "collation": command.get("collation") if isinstance(command.get("collation"), dict) else None,
         "duration_ms": int(attr.get("durationMillis", 0) or 0),
         "docs_examined": int(attr.get("docsExamined", 0) or 0),
@@ -291,47 +325,160 @@ def _filter_touches_strings(filt: Any) -> bool:
     return False
 
 
+def _is_scalar(v: Any) -> bool:
+    return isinstance(v, (str, int, float, bool)) or v is None
+
+
+# Operators we recognize on a per-field condition document
+_RANGE_OPS = {"$gt", "$gte", "$lt", "$lte"}
+_EQ_OPS = {"$eq"}
+
+
+def _build_profile(event: dict[str, Any]) -> QueryProfile:
+    """Construct a structured profile of the query's roles per field.
+
+    This is the data the recommendation engine uses to synthesize an Atlas
+    Search index and a $search pipeline.
+    """
+    profile = QueryProfile(
+        op_type=event.get("op_type", ""),
+        collection=event.get("collection", ""),
+    )
+
+    # Sort / skip / limit
+    sort_doc = event.get("sort") or {}
+    if isinstance(sort_doc, dict):
+        for f, d in sort_doc.items():
+            try:
+                profile.sort_fields.append((f, int(d) if d in (-1, 1) else 1))
+            except (TypeError, ValueError):
+                profile.sort_fields.append((f, 1))
+    if isinstance(event.get("limit"), int):
+        profile.limit = event["limit"]
+    if isinstance(event.get("skip"), int):
+        profile.skip = event["skip"]
+
+    # Collation
+    collation = event.get("collation") or {}
+    if isinstance(collation, dict) and collation.get("strength") in (1, 2):
+        profile.case_insensitive = True
+
+    filters = _all_match_filters(event)
+
+    # Walk every filter doc at the top level (one level deep on field names)
+    for filt in filters:
+        if not isinstance(filt, dict):
+            continue
+        for fname, cond in filt.items():
+            # Top-level operators ($or, $and, $text, $expr) handled separately
+            if fname.startswith("$"):
+                if fname == "$text" and isinstance(cond, dict):
+                    term = cond.get("$search")
+                    if isinstance(term, str):
+                        profile.text_query = term
+                elif fname == "$or" and isinstance(cond, list):
+                    for branch in cond:
+                        if not isinstance(branch, dict):
+                            continue
+                        for bname, bcond in branch.items():
+                            if bname.startswith("$"):
+                                continue
+                            if _looks_text_like(bcond):
+                                profile.or_text_fields.add(bname)
+                            # Also classify ranges within $or branches
+                            _classify_field_cond(profile, bname, bcond)
+                elif fname == "$and" and isinstance(cond, list):
+                    for branch in cond:
+                        if isinstance(branch, dict):
+                            for bname, bcond in branch.items():
+                                if not bname.startswith("$"):
+                                    _classify_field_cond(profile, bname, bcond)
+                continue
+
+            # Regular field: classify by its condition
+            _classify_field_cond(profile, fname, cond)
+
+    return profile
+
+
+def _classify_field_cond(profile: QueryProfile, fname: str, cond: Any) -> None:
+    """Bucket `{fname: cond}` into one of: text/equality/range/regex/autocomplete."""
+    if _is_scalar(cond):
+        # `{field: "value"}` or `{field: 5}` — pure equality
+        if isinstance(cond, str) and cond:
+            # String equality — searchable but also filterable. Treat as equality
+            # (compound.filter.equals) by default; the heuristics elsewhere may
+            # also flag it as text.
+            profile.equality_fields[fname] = cond
+        else:
+            profile.equality_fields[fname] = cond
+        return
+
+    if isinstance(cond, dict):
+        # $regex
+        if "$regex" in cond:
+            pat = cond["$regex"]
+            if isinstance(pat, str):
+                profile.regex_patterns.append((fname, pat))
+                head = pat[:4]
+                if head.startswith(".*") or head.startswith("^.*") or ".*" in head:
+                    profile.autocomplete_fields.add(fname)
+                else:
+                    profile.text_fields.add(fname)
+            return
+
+        # $in with strings → treat as equality (will become $in-style filter)
+        if "$in" in cond and isinstance(cond["$in"], list) and cond["$in"]:
+            profile.equality_fields[fname] = cond["$in"][0]  # sample
+            return
+
+        # Range operators
+        if any(op in cond for op in _RANGE_OPS):
+            profile.range_fields.add(fname)
+            return
+
+        # $eq
+        if "$eq" in cond and _is_scalar(cond["$eq"]):
+            profile.equality_fields[fname] = cond["$eq"]
+            return
+
+        # $ne / $exists / $type — keep as residual (no Atlas Search mapping)
+        # We deliberately don't add these to the profile.
+
+
 def detect(event: dict[str, Any], shape: QueryShape) -> None:
-    """Run all detectors; mutate shape in-place to record categories/severity."""
+    """Run all detectors; mutate shape in-place to record categories/severity.
+
+    Also builds a structured QueryProfile that the recommendation engine
+    uses to synthesize an Atlas Search index + $search pipeline.
+    """
     filters = _all_match_filters(event)
     plan = (event.get("plan_summary") or "").upper()
 
-    has_regex = False
-    regex_lead_wild = False
-    regex_case_insens = False
-    has_text = False
-    in_or = False
-    or_text_fields: set[str] = set()
+    # Build the structured profile first
+    shape.profile = _build_profile(event)
 
+    # Now run yes/no detectors on top of it
+    has_regex = bool(shape.profile.regex_patterns)
+    regex_lead_wild = bool(shape.profile.autocomplete_fields)
+    regex_case_insens = False
+    has_text = shape.profile.text_query is not None
+    in_or = bool(shape.profile.or_text_fields)
+    or_text_fields = shape.profile.or_text_fields
+
+    # Rescan once for $options i (not stored on profile)
     for filt in filters:
         for path, value in _walk(filt):
             last = path.rsplit(".", 1)[-1]
-
-            if last == "$regex":
-                has_regex = True
-                pat = value if isinstance(value, str) else (
-                    value.get("$regex", "") if isinstance(value, dict) else "")
-                if isinstance(pat, str):
-                    head = pat[:4]
-                    if head.startswith(".*") or head.startswith("^.*") or ".*" in head:
-                        regex_lead_wild = True
-
             if last == "$options" and isinstance(value, str) and "i" in value:
                 regex_case_insens = True
+                break
 
-            if last == "$text":
-                has_text = True
-
-            if last == "$or" and isinstance(value, list):
-                in_or = True
-                for branch in value:
-                    if not isinstance(branch, dict):
-                        continue
-                    for fname, cond in branch.items():
-                        if fname.startswith("$"):
-                            continue
-                        if _looks_text_like(cond):
-                            or_text_fields.add(fname)
+    # Promote text-search intent: if $text was present, the searchable fields
+    # are wherever the legacy text index lives — we don't know which from the
+    # log alone, so we emit a placeholder field name that the user replaces.
+    if has_text and not shape.profile.text_fields:
+        shape.profile.text_fields.add("<TEXT_INDEXED_FIELD>")
 
     # Plan summary signal: legacy text index
     fts_index = "IXSCAN" in plan and "_FTS" in plan
@@ -346,6 +493,8 @@ def detect(event: dict[str, Any], shape: QueryShape) -> None:
     if fts_index and "text" not in shape.categories:
         shape.categories.add("fts_index")
         shape.reasons.append(f"planSummary `{event.get('plan_summary')}` indicates a legacy text index.")
+        if not shape.profile.text_fields:
+            shape.profile.text_fields.add("<TEXT_INDEXED_FIELD>")
 
     if has_regex:
         if regex_lead_wild or regex_case_insens:
@@ -355,6 +504,10 @@ def detect(event: dict[str, Any], shape: QueryShape) -> None:
                 bits.append("leading wildcard prevents index use")
             if regex_case_insens:
                 bits.append("case-insensitive flag forces collation/scan")
+                # Promote regex'd fields to autocomplete role for /i case
+                for f, _pat in shape.profile.regex_patterns:
+                    shape.profile.autocomplete_fields.add(f)
+                    shape.profile.text_fields.discard(f)
             shape.reasons.append("$regex with " + " + ".join(bits) + ".")
         else:
             shape.categories.add("regex")
@@ -593,6 +746,19 @@ pre{background:#0a0c12;padding:12px;border-radius:6px;margin:6px 0 0;
 .suggest{background:#0c2418;border:1px solid #13aa52;border-radius:6px;
          padding:10px 12px;margin-top:8px;color:#cfeedd;font-size:12.5px}
 .suggest b{color:var(--accent)}
+.recommendation{margin-top:14px;background:#0a1812;border:1px solid #13aa52;
+                border-radius:8px;padding:14px 16px}
+.recommendation h3{margin:0 0 10px;font-size:13px;text-transform:uppercase;
+                   letter-spacing:.06em;color:var(--accent)}
+.rec-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:1100px){.rec-grid{grid-template-columns:1fr}}
+.rec-label{font-size:12px;color:var(--muted);text-transform:uppercase;
+           letter-spacing:.05em;margin-bottom:6px}
+.rec-code{background:#06100b;border:1px solid #13aa52;color:#d6f5e1;
+          font-size:11.5px;line-height:1.5;max-height:340px;overflow:auto}
+.rec-notes{margin-top:10px;font-size:12.5px;color:#bcd9c8}
+.rec-notes ul{margin:6px 0 0;padding-left:20px}
+.rec-notes li{margin:3px 0}
 .muted{color:var(--muted)}
 .right{text-align:right}
 """
@@ -880,6 +1046,7 @@ def _render_opp_row(i: int, s: QueryShape) -> str:
         for c in sorted(s.categories)
     )
     rid = f"opp-{i}"
+    recommendation_html = _render_recommendation(s)
     return (
         f'<tr class="row expandable" data-id="{rid}" data-severity="{s.severity}">'
         f'<td><span class="sev" style="background:{SEVERITY_COLOR[s.severity]}">{s.severity}</span></td>'
@@ -901,9 +1068,41 @@ def _render_opp_row(i: int, s: QueryShape) -> str:
         f'</ul></div>'
         f'{suggestions}'
         f'<div style="margin-top:10px"><b>Sample filter:</b><pre>{escape(s.sample_filter)}</pre></div>'
+        f'{recommendation_html}'
         f'<details style="margin-top:8px"><summary class="muted">Raw log line</summary>'
         f'<pre>{escape(s.sample_log_line)}</pre></details>'
         f'</td></tr>'
+    )
+
+
+def _render_recommendation(s: QueryShape) -> str:
+    """Render the Atlas Search index + $search pipeline recommendation block."""
+    if not s.profile:
+        return ""
+
+    index_def = build_index_definition(s.profile, name="default")
+    pipeline = build_search_pipeline(s.profile, index_name="default")
+    notes = build_notes(s.profile)
+
+    notes_html = "".join(f"<li>{escape(n)}</li>" for n in notes)
+    coll = s.profile.collection or s.namespace.split(".", 1)[-1]
+
+    return (
+        f'<div class="recommendation">'
+        f'<h3>Suggested Atlas Search migration</h3>'
+        f'<div class="rec-grid">'
+        f'<div>'
+        f'<div class="rec-label">1. Atlas Search index definition'
+        f' <span class="muted">(create on collection <code>{escape(coll)}</code>)</span></div>'
+        f'<pre class="rec-code">{escape(to_pretty_json(index_def))}</pre>'
+        f'</div>'
+        f'<div>'
+        f'<div class="rec-label">2. Replacement aggregation pipeline</div>'
+        f'<pre class="rec-code">{escape(to_pretty_json(pipeline))}</pre>'
+        f'</div>'
+        f'</div>'
+        f'<div class="rec-notes"><b>Notes:</b><ul>{notes_html}</ul></div>'
+        f'</div>'
     )
 
 

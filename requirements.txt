@@ -1,0 +1,4 @@
+# The analyzer (main.py) itself uses only the Python standard library.
+# pymongo is listed here for future cluster-side tooling
+# (e.g. validating recommendations or running benchmarks).
+pymongo>=4.6,<5.0

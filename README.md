@@ -49,12 +49,36 @@ python3 main.py /path/to/mongod.log.gz
 ## Report sections
 
 1. **Summary** — high-level counts and time window
-2. **Atlas Search Opportunities** — severity-filterable, expandable rows with reasons + suggested Atlas Search operator + raw log sample
+2. **Atlas Search Opportunities** — severity-filterable, expandable rows. Each row reveals:
+   - Reasons + suggested Atlas Search operator
+   - **Suggested Atlas Search index definition** (copy-pasteable JSON)
+   - **Replacement aggregation pipeline** beginning with `$search`
+   - Caveats / analyzer-choice notes
+   - Raw log sample
 3. **All Query Shapes** — top 200 by total duration
 4. **Top Namespaces / Categories**
 5. **Operations / Plan Summaries**
 6. **Error Codes**
 7. **Migration Task Checklist** — auto-generated to-do list grouped by category and namespace, with `queryHash` references
+
+## Recommendation engine
+
+For every detected opportunity the analyzer synthesizes:
+
+1. **Atlas Search index definition** with `dynamic: false` and one explicit field
+   per role (text-searchable → `string`/`lucene.standard`, equality →
+   `token`/`lowercase`, autocomplete → `autocomplete`/`edgeGram`, range/sort →
+   typed `date`/`number`).
+2. **`$search` aggregation pipeline** that maps each part of the original query
+   onto a `compound` clause:
+   - `$text` / regex / `$or` text-fields → `compound.must` / `compound.should`
+   - Equality (`{f: v}`, `{f: {$eq: v}}`, `{f: {$in: [...]}}`) → `compound.filter.equals`
+   - Range (`$gte`/`$lte`/`$gt`/`$lt`) → `compound.filter.range`
+   - Original `$sort` / `$skip` / `$limit` are preserved after `$search`.
+
+The recommendations are heuristic starting points. The "Notes" block in each
+expandable row flags caveats (analyzer language, phrase vs. text, sort by
+score vs. timestamp, ObjectId equality residuals, etc.).
 
 ## Requirements
 
