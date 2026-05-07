@@ -1,0 +1,31 @@
+# Logs (often huge, often contain production data)
+*.log
+*.log.gz
+*.log.zip
+
+# Generated reports
+*.html
+!docs/**/*.html
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+.envrc
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Temp / scratch
+report_smoke.html
+tmp/
+scratch/
