@@ -26,8 +26,8 @@ aggregating by `queryHash`.
 # Smoke test on a sample (recommended first run)
 python3 main.py /path/to/mongod.log --sample 50000
 
-# Full file
-python3 main.py /path/to/mongod.log --out report.html
+# Full file with an index dump for sharper recommendations
+python3 main.py /path/to/mongod.log --indexes indexes.csv --out report.html
 
 # Focused on one database, redacted for sharing
 python3 main.py /path/to/mongod.log --ns "MyApp.*" --redact
@@ -35,6 +35,9 @@ python3 main.py /path/to/mongod.log --ns "MyApp.*" --redact
 # Compressed logs work directly
 python3 main.py /path/to/mongod.log.gz
 ```
+
+If a file named `indexes.csv` exists in the same directory as the log,
+it is auto-loaded — no `--indexes` flag needed.
 
 ### CLI options
 
@@ -46,6 +49,23 @@ python3 main.py /path/to/mongod.log.gz
 | `--sample N` | Stop after N inspected slow-query events (smoke-test mode) |
 | `--ns GLOB` | Limit to a namespace, supports glob (e.g. `"MyDB.*"`) |
 | `--redact` | Replace string values with `xxx` and digits with `9` (production-safe sharing) |
+| `--indexes PATH` | CSV dump of cluster indexes. Auto-detects `indexes.csv` next to the log if omitted. |
+
+### Index CSV format
+
+The expected CSV header (column order is flexible, case-insensitive):
+
+```
+DB Name, Collection Name, Name, Type, Size (MB), Fragmented Size (MB),
+# Primary Ops, # Secondary Ops, Key, Options, isDuplicate
+```
+
+The `Key` column is parsed as a forgiving MongoDB-style document — both
+quoted-JSON (`{"field": 1}`) and unquoted-mongo-doc (`{ field: 1 }`)
+forms are accepted. For `text` indexes, the analyzer recovers real
+weighted field names from the `Options` column's `weights: { ... }`
+block, which is used to resolve `<TEXT_INDEXED_FIELD>` placeholders in
+the generated `$search` pipelines.
 
 ## Report sections
 
@@ -60,7 +80,9 @@ python3 main.py /path/to/mongod.log.gz
 4. **Top Namespaces / Categories**
 5. **Operations / Plan Summaries**
 6. **Error Codes**
-7. **Migration Task Checklist** — auto-generated to-do list grouped by category and namespace, with `queryHash` references
+7. **Drop Candidates** *(when an index CSV is supplied)* — indexes that are safe to drop right now: marked `isDuplicate=true`, or with zero primary and secondary ops since stats reset. Conservative policy: indexes covered by a proposed Atlas Search index are **not** in this list — they should only be dropped after the Search index is built and validated.
+8. **Index Inventory** *(when an index CSV is supplied)* — full table of every index with size, ops, key, derived type (single / compound / text / ttl / 2dsphere / partial), and flags (`text` / `dup` / `unused`).
+9. **Migration Task Checklist** — auto-generated to-do list grouped by category and namespace, with `queryHash` references
 
 ## Recommendation engine
 

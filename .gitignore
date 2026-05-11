@@ -3,6 +3,11 @@
 *.log.gz
 *.log.zip
 
+# Index dumps (production schema info)
+*.csv
+*.xlsx
+*.xls
+
 # Generated reports
 *.html
 !docs/**/*.html

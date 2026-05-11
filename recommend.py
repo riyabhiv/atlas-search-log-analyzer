@@ -22,6 +22,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from indexes import IndexCatalog, IndexEntry
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +54,55 @@ class QueryProfile:
     skip: int | None = None
     # Misc
     case_insensitive: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Catalog-aware enrichment
+# ---------------------------------------------------------------------------
+
+def enrich_with_catalog(profile: QueryProfile,
+                         namespace: str,
+                         catalog: "IndexCatalog | None") -> None:
+    """Mutate `profile` in place using actual index metadata.
+
+    Currently resolves the <TEXT_INDEXED_FIELD> placeholder by reading the
+    weighted field names from any text index on the namespace.
+    """
+    if catalog is None:
+        return
+    if "<TEXT_INDEXED_FIELD>" not in profile.text_fields:
+        return
+    real_fields = catalog.text_index_fields(namespace)
+    if real_fields:
+        profile.text_fields.discard("<TEXT_INDEXED_FIELD>")
+        profile.text_fields.update(real_fields)
+
+
+def find_replaced_indexes(profile: QueryProfile,
+                           namespace: str,
+                           catalog: "IndexCatalog | None") -> list["IndexEntry"]:
+    """Return existing indexes whose key fields are a subset of the proposed
+    Atlas Search index's fields.
+
+    These are informational ("after Atlas Search cutover, these indexes are
+    potentially redundant") — *not* automatic drop recommendations.
+    """
+    if catalog is None:
+        return []
+    proposed_fields = (
+        profile.text_fields
+        | profile.or_text_fields
+        | profile.autocomplete_fields
+        | set(profile.equality_fields.keys())
+        | profile.range_fields
+        | {f for f, _ in profile.sort_fields}
+    )
+    # Don't claim to replace indexes on placeholder fields
+    proposed_fields = {f for f in proposed_fields if not f.startswith("<")}
+    if not proposed_fields:
+        return []
+    return [e for e in catalog.covering_indexes(namespace, proposed_fields)
+            if e.name != "_id_"]
 
 
 # ---------------------------------------------------------------------------

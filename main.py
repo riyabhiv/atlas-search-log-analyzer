@@ -53,7 +53,10 @@ from recommend import (
     build_search_pipeline,
     build_notes,
     to_pretty_json,
+    enrich_with_catalog,
+    find_replaced_indexes,
 )
+from indexes import IndexCatalog, IndexEntry, load_catalog
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +601,7 @@ def analyze(
     sample_limit: int | None = None,
     namespace_filter: str | None = None,
     redact: bool = False,
+    catalog: IndexCatalog | None = None,
 ) -> AnalysisResult:
     result = AnalysisResult()
     ns_re = None
@@ -665,6 +669,9 @@ def analyze(
                 pretty = raw
             shape.sample_log_line = pretty
             detect(event, shape)
+            # Resolve <TEXT_INDEXED_FIELD> placeholders using real index metadata.
+            if shape.profile is not None:
+                enrich_with_catalog(shape.profile, ns, catalog)
 
         shape.count += 1
         shape.total_duration_ms += event["duration_ms"]
@@ -832,7 +839,8 @@ document.addEventListener('DOMContentLoaded',()=>{bindSort();bindFilter();bindSe
 """
 
 
-def render_html(result: AnalysisResult, source: Path, args) -> str:
+def render_html(result: AnalysisResult, source: Path, args,
+                catalog: IndexCatalog | None = None) -> str:
     shapes = list(result.shapes.values())
     # Only opportunities (have at least one Atlas Search category)
     opportunities = [s for s in shapes if s.categories]
@@ -861,6 +869,14 @@ def render_html(result: AnalysisResult, source: Path, args) -> str:
         ("Namespaces", f"{len(result.namespaces):,}"),
         ("Window", _ts_window(result.first_ts, result.last_ts)),
     ]
+    if catalog is not None:
+        drop_list = catalog.drop_candidates()
+        cards_data.extend([
+            ("Indexes loaded", f"{len(catalog.entries):,}"),
+            ("Total index size", f"{catalog.total_size_mb():,.1f} MB"),
+            ("Drop candidates", f"{len(drop_list):,}"),
+            ("Reclaimable", f"{catalog.total_drop_size_mb():,.1f} MB"),
+        ])
     cards_html = "".join(
         f'<div class="card"><div class="card-num">{escape(v)}</div>'
         f'<div class="card-label">{escape(k)}</div></div>'
@@ -904,13 +920,19 @@ def render_html(result: AnalysisResult, source: Path, args) -> str:
     ) or '<tr><td colspan=2 class="muted">No planSummaries.</td></tr>'
 
     # Opportunity rows
-    opp_rows = "\n".join(_render_opp_row(i, s) for i, s in enumerate(opportunities)) \
+    opp_rows = "\n".join(_render_opp_row(i, s, catalog) for i, s in enumerate(opportunities)) \
         or '<tr><td colspan="9" class="muted" style="text-align:center;padding:24px">No Atlas Search opportunities detected.</td></tr>'
 
     # All shapes (for full visibility)
     all_shapes_sorted = sorted(shapes, key=lambda s: -s.total_duration_ms)[:200]
     all_rows = "\n".join(_render_shape_row(i, s) for i, s in enumerate(all_shapes_sorted)) \
         or '<tr><td colspan="8" class="muted">None.</td></tr>'
+
+    # Index inventory & drop candidates (only when catalog is supplied)
+    index_section = _render_index_section(catalog) if catalog else ""
+    drop_section = _render_drop_section(catalog) if catalog else ""
+    index_nav = ('<a href="#indexes">Indexes</a>'
+                 '<a href="#drops">Drop Candidates</a>') if catalog else ""
 
     return f"""<!doctype html>
 <html lang="en">
@@ -937,6 +959,7 @@ def render_html(result: AnalysisResult, source: Path, args) -> str:
   <a href="#ops">Operations</a>
   <a href="#plans">Plan Summaries</a>
   <a href="#errors">Errors</a>
+  {index_nav}
   <a href="#tasks">Migration Tasks</a>
 </nav>
 
@@ -1022,6 +1045,9 @@ def render_html(result: AnalysisResult, source: Path, args) -> str:
       <tbody>{err_table}</tbody></table>
   </section>
 
+  {drop_section}
+  {index_section}
+
   <section id="tasks">
     <h2>Migration Task Checklist</h2>
     {_render_tasks(opportunities)}
@@ -1032,7 +1058,7 @@ def render_html(result: AnalysisResult, source: Path, args) -> str:
 </body></html>"""
 
 
-def _render_opp_row(i: int, s: QueryShape) -> str:
+def _render_opp_row(i: int, s: QueryShape, catalog: IndexCatalog | None = None) -> str:
     cats_html = "".join(
         f'<span class="tag">{escape(CATEGORY_LABEL.get(c,c))}</span>'
         for c in sorted(s.categories)
@@ -1046,7 +1072,7 @@ def _render_opp_row(i: int, s: QueryShape) -> str:
         for c in sorted(s.categories)
     )
     rid = f"opp-{i}"
-    recommendation_html = _render_recommendation(s)
+    recommendation_html = _render_recommendation(s, catalog)
     return (
         f'<tr class="row expandable" data-id="{rid}" data-severity="{s.severity}">'
         f'<td><span class="sev" style="background:{SEVERITY_COLOR[s.severity]}">{s.severity}</span></td>'
@@ -1075,7 +1101,7 @@ def _render_opp_row(i: int, s: QueryShape) -> str:
     )
 
 
-def _render_recommendation(s: QueryShape) -> str:
+def _render_recommendation(s: QueryShape, catalog: IndexCatalog | None = None) -> str:
     """Render the Atlas Search index + $search pipeline recommendation block."""
     if not s.profile:
         return ""
@@ -1086,6 +1112,36 @@ def _render_recommendation(s: QueryShape) -> str:
 
     notes_html = "".join(f"<li>{escape(n)}</li>" for n in notes)
     coll = s.profile.collection or s.namespace.split(".", 1)[-1]
+
+    # If a catalog is loaded, list existing indexes whose fields are a subset of
+    # the proposed Atlas Search index — informational only (conservative policy).
+    replaces_html = ""
+    if catalog is not None:
+        replaced = find_replaced_indexes(s.profile, s.namespace, catalog)
+        if replaced:
+            items = []
+            for e in sorted(replaced, key=lambda x: -x.size_mb):
+                key_html = escape(", ".join(f"{k}:{v}" for k, v in e.key.items()))
+                items.append(
+                    f'<li><code>{escape(e.name)}</code> — '
+                    f'<span class="muted">{key_html}</span> &nbsp; '
+                    f'<span class="muted">({e.size_mb:.1f} MB · '
+                    f'{e.total_ops:,} ops</span>'
+                    + (' · <b style="color:#e08e0b">duplicate</b>' if e.is_duplicate else '')
+                    + (' · <b style="color:#e08e0b">unused</b>' if e.is_unused else '')
+                    + ')</li>'
+                )
+            replaces_html = (
+                f'<div class="rec-notes" style="border-top:1px solid #13aa52;'
+                f'padding-top:8px;margin-top:10px">'
+                f'<b>Existing indexes potentially replaced after Atlas Search cutover '
+                f'({len(replaced)}):</b><ul>{"".join(items)}</ul>'
+                f'<div class="muted" style="margin-top:4px">Conservative policy: '
+                f'<b>do not drop these</b> until the Atlas Search index is built and '
+                f'verified in production. See the Drop Candidates section for indexes '
+                f'safe to drop immediately.</div>'
+                f'</div>'
+            )
 
     return (
         f'<div class="recommendation">'
@@ -1102,6 +1158,7 @@ def _render_recommendation(s: QueryShape) -> str:
         f'</div>'
         f'</div>'
         f'<div class="rec-notes"><b>Notes:</b><ul>{notes_html}</ul></div>'
+        f'{replaces_html}'
         f'</div>'
     )
 
@@ -1120,6 +1177,102 @@ def _render_shape_row(i: int, s: QueryShape) -> str:
         f'<td class="right" data-sort="{kpr:.1f}">{kpr:,.1f}</td>'
         f'<td><code>{escape(plan)}</code></td>'
         f'</tr>'
+    )
+
+
+def _render_drop_section(catalog: IndexCatalog | None) -> str:
+    """List indexes that are safe to drop right now (duplicates + zero-ops)."""
+    if catalog is None:
+        return ""
+    drops = sorted(catalog.drop_candidates(), key=lambda e: (-e.size_mb, e.namespace, e.name))
+    if not drops:
+        return (
+            '<section id="drops"><h2>Drop Candidates</h2>'
+            '<p class="muted">No safe drop candidates found '
+            '(no duplicates, no zero-op indexes).</p></section>'
+        )
+
+    rows: list[str] = []
+    for e in drops:
+        reason = e.drop_candidate or ""
+        key_str = ", ".join(f"{k}:{v}" for k, v in e.key.items()) or "-"
+        tag = '<span class="tag" style="background:#3a1a1d;border-color:#d9363e;color:#ffb1b6">duplicate</span>' \
+            if e.is_duplicate else \
+            '<span class="tag" style="background:#3a2a1a;border-color:#e08e0b;color:#ffd07a">unused</span>'
+        rows.append(
+            f'<tr class="row">'
+            f'<td>{tag}</td>'
+            f'<td><code>{escape(e.namespace)}</code></td>'
+            f'<td><code>{escape(e.name)}</code></td>'
+            f'<td><code class="muted">{escape(key_str)}</code></td>'
+            f'<td class="right" data-sort="{e.size_mb}">{e.size_mb:,.1f}</td>'
+            f'<td class="right" data-sort="{e.total_ops}">{e.total_ops:,}</td>'
+            f'<td class="muted">{escape(reason)}</td>'
+            f'</tr>'
+        )
+    total_mb = sum(e.size_mb for e in drops)
+    return (
+        f'<section id="drops">'
+        f'<h2>Drop Candidates &nbsp;<span class="muted">'
+        f'({len(drops)} indexes, ~{total_mb:,.1f} MB reclaimable)</span></h2>'
+        f'<div class="toolbar">'
+        f'<input class="filter" data-target="#drop-table" placeholder="Filter (namespace, name, key)…" />'
+        f'</div>'
+        f'<table id="drop-table" class="sortable"><thead><tr>'
+        f'<th>Why</th><th>Namespace</th><th>Name</th><th>Key</th>'
+        f'<th data-type="num" class="right">Size (MB)</th>'
+        f'<th data-type="num" class="right">Total Ops</th><th>Reason</th>'
+        f'</tr></thead><tbody>{"".join(rows)}</tbody></table>'
+        f'</section>'
+    )
+
+
+def _render_index_section(catalog: IndexCatalog | None) -> str:
+    """Full index inventory table grouped by namespace, sortable & filterable."""
+    if catalog is None:
+        return ""
+    if not catalog.entries:
+        return ('<section id="indexes"><h2>Index Inventory</h2>'
+                '<p class="muted">No index entries parsed from CSV.</p></section>')
+
+    entries = sorted(catalog.entries, key=lambda e: (-e.size_mb, e.namespace, e.name))
+    rows: list[str] = []
+    for e in entries:
+        key_str = ", ".join(f"{k}:{v}" for k, v in e.key.items()) or "-"
+        flags = []
+        if e.is_text_index:
+            flags.append('<span class="tag" style="background:#0c2418;border-color:#13aa52;color:#a0e7c0">text</span>')
+        if e.is_duplicate:
+            flags.append('<span class="tag" style="background:#3a1a1d;border-color:#d9363e;color:#ffb1b6">dup</span>')
+        if e.is_unused:
+            flags.append('<span class="tag" style="background:#3a2a1a;border-color:#e08e0b;color:#ffd07a">unused</span>')
+        rows.append(
+            f'<tr class="row">'
+            f'<td><code>{escape(e.namespace)}</code></td>'
+            f'<td><code>{escape(e.name)}</code></td>'
+            f'<td>{escape(e.display_type)}</td>'
+            f'<td><code class="muted">{escape(key_str)}</code></td>'
+            f'<td class="right" data-sort="{e.size_mb}">{e.size_mb:,.1f}</td>'
+            f'<td class="right" data-sort="{e.primary_ops}">{e.primary_ops:,}</td>'
+            f'<td class="right" data-sort="{e.secondary_ops}">{e.secondary_ops:,}</td>'
+            f'<td>{" ".join(flags)}</td>'
+            f'</tr>'
+        )
+    return (
+        f'<section id="indexes">'
+        f'<h2>Index Inventory &nbsp;<span class="muted">({len(entries):,} indexes, '
+        f'{catalog.total_size_mb():,.1f} MB total)</span></h2>'
+        f'<div class="toolbar">'
+        f'<input class="filter" data-target="#index-table" placeholder="Filter (namespace, name, key, type)…" />'
+        f'</div>'
+        f'<table id="index-table" class="sortable"><thead><tr>'
+        f'<th>Namespace</th><th>Name</th><th>Type</th><th>Key</th>'
+        f'<th data-type="num" class="right">Size (MB)</th>'
+        f'<th data-type="num" class="right">Primary Ops</th>'
+        f'<th data-type="num" class="right">Secondary Ops</th>'
+        f'<th>Flags</th>'
+        f'</tr></thead><tbody>{"".join(rows)}</tbody></table>'
+        f'</section>'
     )
 
 
@@ -1183,11 +1336,29 @@ def main(argv: list[str] | None = None) -> int:
                    help="Limit to a namespace; supports glob, e.g. 'FalconFlexTripsSvcProd.*'")
     p.add_argument("--redact", action="store_true",
                    help="Redact string/numeric values in the report (production-safe sharing)")
+    p.add_argument("--indexes", type=Path, default=None,
+                   help="CSV dump of cluster indexes (DB, Collection, Name, Type, Size, Ops, Key, …). "
+                        "If omitted, auto-detect 'indexes.csv' next to the log file.")
     args = p.parse_args(argv)
 
     if not args.log.exists():
         print(f"error: log file not found: {args.log}", file=sys.stderr)
         return 2
+
+    # Resolve index catalog: explicit flag wins; otherwise auto-detect.
+    catalog: IndexCatalog | None = None
+    index_path = args.indexes
+    if index_path is None:
+        auto = args.log.parent / "indexes.csv"
+        if auto.exists():
+            index_path = auto
+    if index_path is not None:
+        if not index_path.exists():
+            print(f"error: index CSV not found: {index_path}", file=sys.stderr)
+            return 2
+        catalog = load_catalog(index_path)
+        print(f"Indexes:       loaded {len(catalog.entries):,} entries from {index_path} "
+              f"({catalog.parse_errors:,} parse errors)", file=sys.stderr)
 
     print(f"Analyzing {args.log} (size={_human(args.log.stat().st_size)})…", file=sys.stderr)
     if args.sample:
@@ -1199,8 +1370,9 @@ def main(argv: list[str] | None = None) -> int:
         sample_limit=args.sample,
         namespace_filter=args.ns,
         redact=args.redact,
+        catalog=catalog,
     )
-    html = render_html(result, args.log, args)
+    html = render_html(result, args.log, args, catalog=catalog)
     args.out.write_text(html, encoding="utf-8")
 
     print(f"\nLog lines:     {result.total_lines:,} total, {result.parsed_lines:,} JSON, "
