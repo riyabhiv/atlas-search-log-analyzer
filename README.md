@@ -105,8 +105,29 @@ score vs. timestamp, ObjectId equality residuals, etc.).
 
 ## Requirements
 
-- Python 3.10+
-- No external dependencies (stdlib only)
+- Python 3.9+ (uses `from __future__ import annotations`)
+- No runtime dependencies (stdlib only)
+- For development: `pip install pytest` to run the test suite
+
+## Running the tests
+
+```bash
+python3 -m pytest
+```
+
+The test suite covers every module with ~210 tests in <1 second:
+
+| File | Coverage |
+|---|---|
+| `tests/test_indexes.py` | CSV loader, key/options parser, drop-candidate logic, `display_type` inference, header aliases |
+| `tests/test_log_parser.py` | `extract_event` on every fixture shape, gzip support, `iter_log_lines` malformed handling, internal-namespace skip rules |
+| `tests/test_profile.py` | `_classify_field_cond` per condition shape (scalar, `$eq`, `$in`, `$regex`, range, `$or`, `$and`), `_build_profile` end-to-end |
+| `tests/test_detect.py` | One test per opportunity category — verifies the right tag fires (and doesn't fire on negative cases), severity escalation, placeholder substitution |
+| `tests/test_recommend.py` | Index synthesis (analyzer choice per role), `$search` pipeline shape per category, catalog enrichment, `find_replaced_indexes` |
+| `tests/test_integration.py` | End-to-end on a 20-line synthetic log + CSV; asserts query aggregation by `queryHash`, namespace skip, HTML section presence, real-field resolution |
+
+Fixtures (synthetic log lines, CSV) live in `tests/fixtures/` and are
+hand-crafted to be obvious and deterministic.
 
 ## How it works
 

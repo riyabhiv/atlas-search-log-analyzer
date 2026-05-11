@@ -1,0 +1,9 @@
+DB Name,Collection Name,Name,Type,Size (MB),Fragmented Size (MB),# Primary Ops,# Secondary Ops,Key,Options,isDuplicate
+MyApp,Users,_id_,mongod,5.0,0.0,1000,500,"{ _id: 1 }",,false
+MyApp,Users,EmailIdx,mongod,8.0,0.5,15000,800,"{ Email: 1 }",,false
+MyApp,Users,UnusedIdx,mongod,20.0,1.0,0,0,"{ LastLogin: 1 }",,false
+MyApp,Products,_id_,mongod,5.0,0.0,500,200,"{ _id: 1 }",,false
+MyApp,Orders,_id_,mongod,5.0,0.0,2000,1000,"{ _id: 1 }",,false
+MyApp,Orders,OrdersTextIdx,mongod,15.0,0.5,300,200,"{ _fts: ""text"", _ftsx: 1 }","{""weights"":{""Notes"":1,""ShipTo.Address"":1}}",false
+MyApp,Orders,CreatedAtIdx,mongod,12.0,0.3,8000,4000,"{ CreatedAtUtc: 1 }",,false
+MyApp,Orders,DupCreatedAtIdx,mongod,12.0,0.0,0,0,"{ CreatedAtUtc: 1 }",,true

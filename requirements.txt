@@ -2,3 +2,6 @@
 # pymongo is listed here for future cluster-side tooling
 # (e.g. validating recommendations or running benchmarks).
 pymongo>=4.6,<5.0
+
+# Dev/test only — not needed to run the analyzer.
+pytest>=7.0
