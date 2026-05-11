@@ -7,8 +7,11 @@
 *.csv
 *.xlsx
 *.xls
-# ...except the synthetic test fixtures
+
+# ...except the synthetic test fixtures, which must ship with the repo
+# so the test suite works on a fresh clone.
 !tests/fixtures/*.csv
+!tests/fixtures/*.log
 
 # Generated reports
 *.html
